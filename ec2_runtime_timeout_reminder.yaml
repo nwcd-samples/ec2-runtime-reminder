@@ -1,0 +1,270 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: 'CloudFormation Template for DynamoDB Table'
+
+Parameters:
+  TableName:
+    Type: String
+    Default: "mytempec2type"
+    AllowedPattern: "[a-zA-Z0-9_]{3,}"
+    Description: Name for the DynamoDB Table Table name must be at least 3 characters long
+  AlertEC2Type:
+    Type: String
+    Description: Instance Type for the Alert. For example. g4dn.*  or g4dn.4xlarge
+  AlertRunDays:
+    Type: String
+    Description: The Number of days to trigger the alert. Enter an integer value.
+  SubscriptionMail:
+    Type: String
+    Description: "Email address to subscribe to the SNS topic. Change it to your email."
+
+Resources:
+  MyDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      AttributeDefinitions:
+        - AttributeName: ec2type
+          AttributeType: S
+        - AttributeName: maxrundays
+          AttributeType: N
+      KeySchema:
+        - AttributeName: ec2type
+          KeyType: HASH
+        - AttributeName: maxrundays
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 3
+        WriteCapacityUnits: 3
+  MyLambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws-cn:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws-cn:iam::aws:policy/AmazonDynamoDBFullAccess'
+        - 'arn:aws-cn:iam::aws:policy/AmazonSNSFullAccess'
+        - 'arn:aws-cn:iam::aws:policy/AmazonEC2ReadOnlyAccess'
+  MyInitDDBLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Runtime: nodejs16.x
+      Handler: index.handler
+      Role: !GetAtt MyLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          tableName: !Ref TableName
+          ec2type: !Ref AlertEC2Type
+          maxrundays: !Ref AlertRunDays
+          region: !Ref AWS::Region
+      Code: 
+        ZipFile: |
+          var response = require('cfn-response');
+          var AWS = require("aws-sdk");
+
+          // Create a new DynamoDB instance
+
+
+          exports.handler = function(event, context) {
+            // Fetch environment variables
+            const { tableName, ec2type, maxrundays ,region} = process.env;
+            AWS.config.update({region: region});
+            var dynamoDB = new AWS.DynamoDB({ apiVersion: "2012-08-10" });
+
+                
+                
+                // Create an item to be inserted into the DynamoDB table
+                var params = {
+                    TableName: tableName,
+                    Item: {
+                        ec2type: { S: ec2type },
+                        maxrundays:{ N: maxrundays},
+                    },
+                };
+                
+                // Insert the item into the DynamoDB table
+                dynamoDB.putItem(params,function (err, data) {
+                  if (err) {
+                    console.log("Error", err);
+                    var responseData = {Value:  'Item inserted error.'};
+                    response.send(event, context, response.FAILED, responseData);
+
+                  } else {
+                    console.log("Success", data);
+                    var responseData = {Value:  'Item inserted successfully.'};
+                    response.send(event, context, response.SUCCESS, responseData);
+                          
+
+                  }
+                });
+
+
+                // Return success response
+                return {
+                    statusCode: 200,
+                    body: JSON.stringify({ message: 'Item inserted successfully.' })
+
+                };
+           
+          };
+
+      Timeout: 30
+  InvokeInitDBLambdaOnce:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: MyInitDDBLambdaFunction
+    Version: "1.0"
+    Properties:
+      ServiceToken: !GetAtt MyInitDDBLambdaFunction.Arn
+  MySNSTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: "MyEC2 Notify"
+  MySubscription:
+    Type: "AWS::SNS::Subscription"
+    Properties:
+      Protocol: "email"
+      Endpoint: !Ref SubscriptionMail
+      TopicArn: !Ref MySNSTopic
+  MyEC2NotifyLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt MyLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          snsTopicArn: !Ref MySNSTopic
+          tableName: !Ref TableName
+          region: !Ref AWS::Region
+      Code: 
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime, timedelta, timezone
+
+          def getdata():
+              
+              # Create a DynamoDB resource
+              dynamodb = boto3.resource('dynamodb')
+
+              # Specify the table name
+              table_name = os.environ.get('tableName')
+              table = dynamodb.Table(table_name)
+
+              # Scan the table to retrieve all items
+              response = table.scan()
+              items = response['Items']
+
+              # If there are more items to retrieve, continue scanning
+              while 'LastEvaluatedKey' in response:
+                  response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+                  items.extend(response['Items'])
+
+              # Process the retrieved items
+              notifymsg = ''
+              for item in items:
+                  ec2type = item['ec2type']
+                  maxrundays = item['maxrundays']
+                  response1 = getec2list(ec2type,maxrundays)
+                  print(response1)
+                  notifymsg = notifymsg + response1
+              if len(notifymsg) == 0:
+                return
+              mysns = os.environ.get('snsTopicArn')
+              session = boto3.Session(region_name=os.environ.get('region'))
+              snsclient =session.client('sns')
+              snsArn = mysns
+              snsmsg = "You have ec2 Running for longer than expected duration \n %s" %(notifymsg)
+              response = snsclient.publish(TopicArn=snsArn,Message=snsmsg,Subject='EC2 Running Outtime Warnning')
+                        
+
+          def getec2list(ec2type,maxrundays):
+                            
+              session = boto3.Session(region_name=os.environ.get('region'))
+              ec2 = session.client('ec2')
+              notifymsg = ""
+              # Filter instances by instance type
+              instances = ec2.describe_instances(Filters=[
+                  {
+                      'Name': 'instance-type',
+                      'Values': [ec2type] 
+                  },
+                  {
+                      'Name': 'instance-state-name', 
+                      'Values': ['running']
+                      
+                  }
+              ])['Reservations']
+              
+              
+
+              # Calculate the cutoff time (1 day ago)
+              UTC = timezone(timedelta(hours=+0))
+              #cutoff_time = datetime.now(UTC) - timedelta(days=1)
+              cutoff_time = datetime.now(UTC) - timedelta(minutes=int(maxrundays))
+
+              
+              # Iterate over instances and print name and private IP if start time is greater than cutoff
+              for reservation in instances:
+                  for instance in reservation['Instances']:
+                      isprod = 0
+                      tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
+                      if tags.get('prod') == '1':
+                          isprod = 1
+                      if isprod != 1:
+                          launch_time = instance['LaunchTime']
+                          if launch_time < cutoff_time:
+                              instance_name = instance.get('PrivateDnsName', 'No Name')
+                              private_ip = instance['PrivateIpAddress']
+                              #print(f"Instance Name: {instance_name}, Private IP: {private_ip}")
+                              notifymsg = "%sInstance Name: %s Private IP:%s \n" %(notifymsg,instance_name,private_ip)
+                                  
+              
+              return notifymsg
+
+
+          def lambda_handler(event, context):
+              getdata()
+
+
+
+      Timeout: 90
+
+  LambdaRunEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: "cron(0 1 * * ? *)" # Run every day at 9:00 AM Asia/Shanghai
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MyEC2NotifyLambdaFunction.Arn
+          Id: !Ref MyEC2NotifyLambdaFunction
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref MyEC2NotifyLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "LambdaRunEventRule"
+          - "Arn"
+Outputs:
+  DynamoDBTableName:
+    Value: !Ref MyDynamoDBTable
+    Description: Name of the created DynamoDB table
+  NotifySNSTopicName:
+    Value: !Ref MySNSTopic
+    Description: Name of the SNS
+  InitDDBLambda:
+    Value: !Ref MyInitDDBLambdaFunction
+    Description: Name of the MyInitDDBLambdaFunction
+  NotifyLambda:
+    Value: !Ref MyEC2NotifyLambdaFunction
+    Description: Name of the NotifyLambdaFunction
+
