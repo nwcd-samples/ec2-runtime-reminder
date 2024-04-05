@@ -43,4 +43,4 @@ https://console.amazonaws.cn/cloudformation/home#/stacks/new?templateURL=https:/
 删除cloudformation 堆栈即可。
  ![](img/10.png)
 
-Cloudformation 模版地址：http://github.com/nwcd-samples/
+Cloudformation 模版地址：[https://github.com/nwcd-samples/ec2-runtime-reminder](https://github.com/nwcd-samples/ec2-runtime-reminder)
